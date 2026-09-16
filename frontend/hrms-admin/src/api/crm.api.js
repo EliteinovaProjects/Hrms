@@ -18,11 +18,15 @@ export const crmApi = {
     report: (params) => axiosClient.get(C.LEADS_REPORT, { params, responseType: "blob" }),
     log: (params) => axiosClient.get(C.LEADS_LOG, { params }),
     logSummary: () => axiosClient.get(C.LEADS_LOG_SUMMARY),
+    getAssignmentSettings: () => axiosClient.get(C.LEAD_ASSIGNMENT_SETTINGS),
+    updateAssignmentSettings: (mode) => axiosClient.put(C.LEAD_ASSIGNMENT_SETTINGS, { mode }),
+    autoAssignNow: () => axiosClient.post(C.LEAD_AUTO_ASSIGN_NOW),
   },
 
   leadUploads: {
     ...createCrudApi({ listUrl: C.LEAD_UPLOADS, itemUrl: C.LEAD_UPLOADS_ITEM }),
     deactivate: (id) => axiosClient.delete(`${C.LEAD_UPLOADS_ITEM(id)}/deactivate`),
+    deletePermanently: (id) => axiosClient.delete(C.LEAD_UPLOADS_DELETE(id)),
     upload: (file, assignedTo) => {
       const formData = new FormData();
       formData.append("file", file);

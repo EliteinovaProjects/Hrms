@@ -5,7 +5,8 @@ orphaned Customer without its Lead being marked Converted.
 """
 
 import io
-from datetime import timedelta
+import random
+from datetime import date, timedelta
 
 from flask import jsonify, request, send_file
 from flask_jwt_extended import jwt_required
@@ -14,7 +15,15 @@ from openpyxl.utils import get_column_letter
 from sqlalchemy.exc import IntegrityError
 
 from extensions import db
-from models import Customer, Lead , Employee , LeadAssignmentHistory, LeadStatusHistory
+from models import (
+    Customer,
+    Department,
+    Lead,
+    Employee,
+    LeadAssignmentHistory,
+    LeadAssignmentSetting,
+    LeadStatusHistory,
+)
 from utils import (
     fetch_or_404,
     handle_integrity_error,
@@ -253,6 +262,125 @@ def assign_lead(lead_id, token_response):
         {
             "message": "Lead assigned",
             "data": {"lead": lead.to_dict(), "history": history.to_dict()},
+            "token_response": token_response,
+        }
+    ), 200
+
+
+def _active_crm_employee_ids():
+    """CRM-department, active employees eligible to receive an
+    automatically-assigned lead."""
+    return [
+        row[0]
+        for row in db.session.query(Employee.id)
+        .join(Department, Employee.department_id == Department.id)
+        .filter(
+            db.func.lower(Department.department_name) == "crm",
+            Employee.is_active == True,  # noqa: E712
+        )
+        .all()
+    ]
+
+
+def run_auto_lead_assignment(assigner_employee_id=None):
+    """Randomly hands every currently-unassigned, active Lead to one of
+    the active CRM employees — one employee per lead, chosen at random
+    each time (not strict round-robin), so the distribution evens out
+    over repeated runs without needing extra state. Used both by the
+    admin's manual "Run Now" and by the opportunistic 9 AM daily trigger
+    in app.py. Returns the number of leads assigned."""
+    employee_ids = _active_crm_employee_ids()
+    if not employee_ids:
+        return 0
+
+    unassigned = Lead.query.filter(
+        Lead.assigned_to.is_(None), Lead.is_active.is_(True)
+    ).all()
+    if not unassigned:
+        return 0
+
+    assigned_count = 0
+    for lead in unassigned:
+        chosen = random.choice(employee_ids)
+        history = LeadAssignmentHistory(
+            lead_id=lead.id,
+            assigned_to=chosen,
+            assigned_by=assigner_employee_id,
+            previous_assignee_id=lead.assigned_to,
+        )
+        lead.assigned_to = chosen
+        db.session.add(history)
+        assigned_count += 1
+
+    db.session.commit()
+    return assigned_count
+
+
+@leads_bp.route("/assignment-settings", methods=["GET"])
+@jwt_required()
+@with_token
+def get_lead_assignment_settings(token_response):
+    if not is_admin(get_current_user()):
+        return jsonify({"message": "Admin privileges required"}), 403
+
+    setting = LeadAssignmentSetting.get_or_create()
+    return jsonify(
+        {
+            "message": "Lead assignment settings fetched",
+            "data": setting.to_dict(),
+            "token_response": token_response,
+        }
+    ), 200
+
+
+@leads_bp.route("/assignment-settings", methods=["PUT"])
+@jwt_required()
+@with_token
+def update_lead_assignment_settings(token_response):
+    current_user = get_current_user()
+    if not is_admin(current_user):
+        return jsonify({"message": "Admin privileges required"}), 403
+
+    data = request.json or {}
+    mode = data.get("mode")
+    if mode not in ("Manual", "Automatic"):
+        return jsonify({"message": "mode must be 'Manual' or 'Automatic'"}), 400
+
+    setting = LeadAssignmentSetting.get_or_create()
+    setting.mode = mode
+    setting.updated_by = current_user.id
+    db.session.commit()
+
+    return jsonify(
+        {
+            "message": f"Lead assignment mode set to {mode}",
+            "data": setting.to_dict(),
+            "token_response": token_response,
+        }
+    ), 200
+
+
+@leads_bp.route("/auto-assign-now", methods=["POST"])
+@jwt_required()
+@with_token
+def trigger_auto_lead_assignment(token_response):
+    """Admin-triggered on-demand run of the same random CRM-employee
+    assignment the 9 AM automatic job performs — lets admin assign
+    whatever's currently unassigned without waiting for the next morning,
+    same pattern as CRM Incentives' "Run Payout Now"."""
+    current_user = get_current_user()
+    if not is_admin(current_user):
+        return jsonify({"message": "Admin privileges required"}), 403
+
+    assigner_employee = getattr(current_user, "employee", None)
+    count = run_auto_lead_assignment(
+        assigner_employee_id=assigner_employee.id if assigner_employee else None
+    )
+
+    return jsonify(
+        {
+            "message": f"{count} lead(s) auto-assigned" if count else "No unassigned leads to assign",
+            "data": {"assigned_count": count},
             "token_response": token_response,
         }
     ), 200

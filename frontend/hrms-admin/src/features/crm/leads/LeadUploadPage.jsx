@@ -13,7 +13,7 @@ import {
   useLeadUploads,
   useUploadLeads,
   useUploadLeadPhoto,
-  useDeactivateLeadUpload,
+  useDeleteLeadUploadPermanently,
 } from "./useLeadUpload";
 
 import { useCRMEmployeeOptions } from "@/hooks/useLookupOptions";
@@ -410,7 +410,7 @@ export default function LeadUploadPage() {
 
   const uploadLeads = useUploadLeads();
   const uploadLeadPhoto = useUploadLeadPhoto();
-  const deactivateLeadUpload = useDeactivateLeadUpload();
+  const deleteLeadUploadPermanently = useDeleteLeadUploadPermanently();
   const crmEmployeeOptions = useCRMEmployeeOptions();
   // Locked to just "self" for a CRM Marketing employee login — see note
   // above ownEmployeeId/defaultAssignee.
@@ -632,16 +632,16 @@ export default function LeadUploadPage() {
     setPage(1);
   };
 
-  const confirmDeactivate = async () => {
+  const confirmDeletePermanently = async () => {
     if (!deleteTarget?.id) return;
 
     try {
-      await deactivateLeadUpload.mutateAsync(deleteTarget.id);
-      showToast("Upload batch removed", "success");
+      await deleteLeadUploadPermanently.mutateAsync(deleteTarget.id);
+      showToast("Upload batch and its leads permanently deleted", "success");
       setDeleteTarget(null);
     } catch (error) {
       showToast(
-        error?.response?.data?.message || error?.message || "Failed to remove the batch",
+        error?.response?.data?.message || error?.message || "Failed to delete the batch",
         "error"
       );
     }
@@ -1136,15 +1136,13 @@ export default function LeadUploadPage() {
                       >
                         <EyeIcon />
                       </button>
-                      {batch.is_active !== false && (
-                        <button
-                          type="button"
-                          onClick={() => setDeleteTarget(batch)}
-                          className="rounded-lg border border-red-200 px-2.5 py-1.5 text-xs font-medium text-red-600 transition hover:bg-red-50 dark:border-red-900/50 dark:text-red-400 dark:hover:bg-red-500/10"
-                        >
-                          Remove
-                        </button>
-                      )}
+                      <button
+                        type="button"
+                        onClick={() => setDeleteTarget(batch)}
+                        className="rounded-lg border border-red-200 px-2.5 py-1.5 text-xs font-medium text-red-600 transition hover:bg-red-50 dark:border-red-900/50 dark:text-red-400 dark:hover:bg-red-500/10"
+                      >
+                        Delete
+                      </button>
                     </div>
                   </td>
                 </tr>
@@ -1212,19 +1210,13 @@ export default function LeadUploadPage() {
                   >
                     <EyeIcon />
                   </button>
-                  {batch.is_active !== false ? (
-                    <button
-                      type="button"
-                      onClick={() => setDeleteTarget(batch)}
-                      className="rounded-lg border border-red-200 px-2 py-1 text-[11px] font-medium text-red-600 transition hover:bg-red-50 dark:border-red-900/50 dark:text-red-400 dark:hover:bg-red-500/10"
-                    >
-                      Remove
-                    </button>
-                  ) : (
-                    <Badge className="bg-slate-100 text-slate-500 dark:bg-white/10 dark:text-slate-400">
-                      Removed
-                    </Badge>
-                  )}
+                  <button
+                    type="button"
+                    onClick={() => setDeleteTarget(batch)}
+                    className="rounded-lg border border-red-200 px-2 py-1 text-[11px] font-medium text-red-600 transition hover:bg-red-50 dark:border-red-900/50 dark:text-red-400 dark:hover:bg-red-500/10"
+                  >
+                    Delete
+                  </button>
                 </div>
               </div>
             </div>
@@ -1260,15 +1252,15 @@ export default function LeadUploadPage() {
       <ConfirmDialog
         open={!!deleteTarget}
         onClose={() => setDeleteTarget(null)}
-        onConfirm={confirmDeactivate}
-        title="Remove Upload Batch"
+        onConfirm={confirmDeletePermanently}
+        title="Delete Permanently"
         message={
           deleteTarget
-            ? `Are you sure you want to remove "${deleteTarget.file_name}" from the history? The leads it already created are not deleted.`
+            ? `Do you want to delete "${deleteTarget.file_name}" permanently? This removes the upload and all ${deleteTarget.success_count || 0} lead(s) it created — this cannot be undone.`
             : ""
         }
-        confirmText="Remove"
-        loading={deactivateLeadUpload.isPending}
+        confirmText="Yes, Delete"
+        loading={deleteLeadUploadPermanently.isPending}
       />
 
       {photoPreviewOpen && photoPreview && (

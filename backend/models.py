@@ -2371,6 +2371,52 @@ class LeadUploadBatch(TimestampMixin, db.Model):
     def to_dict(self):
         data = super().to_dict()
         data["uploader"] = _summary(self.uploader, ["id", "username", "email"])
+        employee = getattr(self.uploader, "employee", None)
+        data["uploader_employee"] = (
+            _summary(employee, ["id", "employee_code", "first_name", "last_name", "phone"])
+            if employee
+            else None
+        )
+        leads = self.leads or []
+        data["lead_count"] = len(leads)
+        # Representative location/source for the batch list view — a
+        # batch is usually one homogeneous upload, so the first non-empty
+        # value stands in for the whole batch rather than listing every
+        # lead's own value here.
+        data["location"] = next((l.location for l in leads if l.location), None)
+        data["source"] = next((l.source for l in leads if l.source), None)
+        return data
+
+
+class LeadAssignmentSetting(TimestampMixin, db.Model):
+    """Singleton row (id is always 1) controlling how new leads get
+    assigned to CRM employees: Manual (admin picks per-lead/per-batch) or
+    Automatic (every unassigned lead is randomly handed out to an active
+    CRM employee once a day at 9:00 AM — see app.py's opportunistic
+    before_request trigger, mirroring the incentive payout's pattern since
+    this deployment has no cron/task-queue infra)."""
+
+    __tablename__ = "lead_assignment_settings"
+
+    id = db.Column(db.Integer, primary_key=True)
+    mode = db.Column(db.String(20), default="Manual")  # "Manual" | "Automatic"
+    last_auto_run_date = db.Column(db.Date, nullable=True)
+    updated_by = db.Column(db.Integer, db.ForeignKey("base_users.id"), nullable=True)
+
+    updater = db.relationship("BaseUser", foreign_keys=[updated_by])
+
+    @classmethod
+    def get_or_create(cls):
+        setting = cls.query.get(1)
+        if not setting:
+            setting = cls(id=1, mode="Manual")
+            db.session.add(setting)
+            db.session.commit()
+        return setting
+
+    def to_dict(self):
+        data = super().to_dict()
+        data["updater"] = _summary(self.updater, ["id", "username", "email"])
         return data
 
 

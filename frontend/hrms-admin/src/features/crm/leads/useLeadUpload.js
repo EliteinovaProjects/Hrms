@@ -74,3 +74,21 @@ export function useDeactivateLeadUpload() {
     },
   });
 }
+
+/* =========================================================
+   PERMANENT DELETE — removes the batch AND every Lead it created, so
+   the batch also disappears from admin's Lead Generation Report.
+========================================================= */
+
+export function useDeleteLeadUploadPermanently() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (id) => api.deletePermanently(id),
+
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["lead-uploads"] });
+      queryClient.invalidateQueries({ queryKey: ["leads"] });
+    },
+  });
+}

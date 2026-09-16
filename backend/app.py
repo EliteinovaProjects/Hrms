@@ -1,5 +1,5 @@
 import os
-from datetime import date
+from datetime import date, datetime
 from urllib.parse import urlparse
 
 from flask import Flask, request
@@ -16,6 +16,7 @@ from api.v1 import blueprints
 
 
 app = Flask(__name__)
+print(app)
 
 app.config.from_object(Config)
 
@@ -108,6 +109,47 @@ def _maybe_run_auto_salary_payroll():
     )
     try:
         auto_generate_due_salary_payroll(today)
+    except Exception:
+        db.session.rollback()
+
+
+# ==================================================================
+#  AUTOMATED LEAD ASSIGNMENT (9:00 AM daily, when Automatic mode is on)
+#
+# Same opportunistic-off-real-traffic pattern as the two triggers above:
+# the first request on/after 9:00 AM each day checks
+# LeadAssignmentSetting.mode, and if it's "Automatic", randomly hands
+# every currently-unassigned lead to an active CRM employee (see
+# api/v1/crm/leads.run_auto_lead_assignment). Idempotent per day via
+# LeadAssignmentSetting.last_auto_run_date, same as the payout/payroll
+# checks' own date guards.
+# ==================================================================
+
+_last_auto_lead_assignment_check = None
+
+
+@app.before_request
+def _maybe_run_auto_lead_assignment():
+    global _last_auto_lead_assignment_check
+
+    if not request.path.startswith("/api/v1/"):
+        return
+
+    now = datetime.now()
+    today = now.date()
+    if now.hour < 9 or _last_auto_lead_assignment_check == today:
+        return
+    _last_auto_lead_assignment_check = today
+
+    from models import LeadAssignmentSetting
+    from api.v1.crm.leads import run_auto_lead_assignment
+
+    try:
+        setting = LeadAssignmentSetting.get_or_create()
+        if setting.mode == "Automatic" and setting.last_auto_run_date != today:
+            run_auto_lead_assignment()
+            setting.last_auto_run_date = today
+            db.session.commit()
     except Exception:
         db.session.rollback()
 

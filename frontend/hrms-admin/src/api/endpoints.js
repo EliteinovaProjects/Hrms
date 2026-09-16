@@ -340,6 +340,15 @@ export const API = {
     LEAD_ASSIGN: (id) =>
       `/leads/${id}/assign`,
 
+    LEAD_ASSIGNMENT_SETTINGS:
+      "/leads/assignment-settings",
+
+    LEAD_AUTO_ASSIGN_NOW:
+      "/leads/auto-assign-now",
+
+    LEAD_UPLOADS_DELETE: (batchId) =>
+      `/lead-uploads/${batchId}`,
+
     LEAD_STATUS_CHANGE: (id) =>
       `/leads/${id}/status`,
 

@@ -530,3 +530,45 @@ def deactivate_lead_upload(batch_id, token_response):
     batch.is_active = False
     db.session.commit()
     return jsonify({"message": "Lead upload batch deactivated", "data": batch.to_dict(), "token_response": token_response}), 200
+
+
+@lead_uploads_bp.route("/<int:batch_id>", methods=["DELETE"])
+@jwt_required()
+@with_token
+def delete_lead_upload_permanently(batch_id, token_response):
+    """Permanently deletes an upload batch AND every Lead it created — a
+    CRM Marketing login removing a batch (e.g. a misread photo upload) is
+    expected to actually erase it, including from the admin's Lead
+    Generation Report, not just hide it via is_active like /deactivate
+    does. A CRM Marketing login may only delete its own uploads; admin can
+    delete any."""
+    current_user = get_current_user()
+
+    batch, error_response = fetch_or_404(LeadUploadBatch, batch_id)
+    if error_response:
+        return error_response
+
+    if not is_admin(current_user) and batch.uploaded_by != current_user.id:
+        return jsonify({"message": "You can only delete your own uploads"}), 403
+
+    try:
+        for lead in Lead.query.filter(Lead.upload_batch_id == batch_id).all():
+            db.session.delete(lead)
+        db.session.delete(batch)
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        return jsonify({
+            "message": (
+                "Could not permanently delete this upload — one of its leads has "
+                "already progressed (e.g. converted to a customer or reassigned). "
+                "Remove it from the batch instead, or deactivate the upload."
+            )
+        }), 409
+
+    return jsonify(
+        {
+            "message": "Lead upload batch and its leads permanently deleted",
+            "token_response": token_response,
+        }
+    ), 200
