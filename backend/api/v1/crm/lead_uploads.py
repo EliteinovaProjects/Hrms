@@ -28,12 +28,10 @@ as an environment variable (free key: https://ocr.space/ocrapi/freekey).
 
 import io
 import re
-
 import requests
 from flask import Blueprint, current_app, jsonify, request, send_file
 from flask_jwt_extended import jwt_required
 from openpyxl import Workbook, load_workbook
-
 from extensions import db
 from models import Lead, LeadUploadBatch
 from utils import (
@@ -52,11 +50,28 @@ ALLOWED_EXTENSIONS = {"xlsx"}
 ALLOWED_IMAGE_EXTENSIONS = {"png", "jpg", "jpeg"}
 EXPECTED_COLUMNS = ["lead_name", "contact_number", "email", "source", "status", "groom_for_whom", "location"]
 
-# International-ish phone pattern: an optional "+", then 8-15 digits with
-# optional spaces/dashes in between — permissive on purpose since OCR text
-# is noisy; the extracted match is then stripped down to bare digits (plus
-# a leading "+") before being stored.
-_PHONE_PATTERN = re.compile(r"\+?\d[\d\s\-]{6,}\d")
+# Leading row index, e.g. "53)", "53.", "(53)" — stripped off the front of
+# a line before the name is taken
+_LEADING_INDEX_PATTERN = re.compile(r"^\s*\(?\d{1,4}\)?[.\):\-]?\s*")
+
+# Splits the text after the phone number into up to two fields (relation,
+# location) — OCR output is inconsistent about which delimiter survives
+# ("|", "/", or just a run of 2+ spaces where a pipe was), so any of them
+# is accepted. We require spaces around / to avoid breaking URLs, but
+# keep pipe as strong delimiter.
+_AFTER_PHONE_SPLIT_PATTERN = re.compile(r"\s*\|\s*|\s+/\s+|\s{2,}")
+
+# FIX: Phone candidate that allows / ( ) as separators - OCR.space often
+# returns "9791/25407" instead of "9791125407". We clean to digits after.
+# 8-15 digits range so noisy OCR still creates a row instead of dropping it.
+_PHONE_CANDIDATE_RE = re.compile(r"\+?[\d][\d\s\-\/\(\)]{6,}\d")
+
+OCR_SPACE_ENDPOINT = "https://api.ocr.space/parse/image"
+
+
+class OcrNotConfiguredError(Exception):
+    """Raised when OCR_SPACE_API_KEY isn't set — distinct from a network/
+    API failure so the route can return a clear, actionable message."""
 
 
 def _can_upload_leads(current_user):
@@ -71,12 +86,26 @@ def _allowed_image(filename):
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_IMAGE_EXTENSIONS
 
 
-OCR_SPACE_ENDPOINT = "https://api.ocr.space/parse/image"
+def _clean_phone(raw: str) -> str:
+    """Strip everything except digits, keep leading + if present."""
+    if not raw:
+        return ""
+    has_plus = raw.strip().startswith("+")
+    digits = re.sub(r"[^\d]", "", raw)
+    return ("+" + digits) if has_plus and digits else digits
 
 
-class OcrNotConfiguredError(Exception):
-    """Raised when OCR_SPACE_API_KEY isn't set — distinct from a network/
-    API failure so the route can return a clear, actionable message."""
+def _find_phone(line: str):
+    """Find best phone-like token in a line. Returns (match_obj, cleaned_phone) or (None, None)."""
+    best = None
+    for m in _PHONE_CANDIDATE_RE.finditer(line or ""):
+        cleaned = _clean_phone(m.group(0))
+        digit_len = len(re.sub(r"[^\d]", "", cleaned))
+        if 8 <= digit_len <= 15:
+            # Prefer longest digit run (more likely full number)
+            if best is None or digit_len > len(re.sub(r"[^\d]", "", best[1])):
+                best = (m, cleaned)
+    return best if best else (None, None)
 
 
 def _run_ocr(image_bytes, filename):
@@ -84,6 +113,7 @@ def _run_ocr(image_bytes, filename):
     recognized text. No local model/binary — keeps this backend's
     deployment bundle tiny (see module docstring for why that matters
     on Vercel)."""
+
     api_key = current_app.config.get("OCR_SPACE_API_KEY")
     if not api_key:
         raise OcrNotConfiguredError()
@@ -95,6 +125,7 @@ def _run_ocr(image_bytes, filename):
             "apikey": api_key,
             "language": "eng",
             "isOverlayRequired": False,
+            "isTable": True,  # helps for ruled notebook pages
             "OCREngine": 2,
         },
         timeout=30,
@@ -131,6 +162,7 @@ def _build_lead(
 ):
     """Single place that shapes a Lead row from raw field values, shared by
     the .xlsx row loop and the photo/OCR path so both stay in sync."""
+
     return Lead(
         lead_name=str(lead_name).strip()[:150],
         contact_number=(str(contact_number).strip()[:15] if contact_number else None),
@@ -147,18 +179,6 @@ def _build_lead(
     )
 
 
-# Leading row index, e.g. "53)", "53.", "(53)" — stripped off the front of
-# a line before the name is taken, rather than baked into one all-or-nothing
-# line pattern (a single missed group there used to drop the whole row).
-_LEADING_INDEX_PATTERN = re.compile(r"^\s*\(?\d{1,4}\)?[.\):\-]?\s*")
-
-# Splits the text after the phone number into up to two fields (relation,
-# location) — OCR output is inconsistent about which delimiter survives
-# ("|", "/", or just a run of 2+ spaces where a pipe was), so any of them
-# is accepted.
-_AFTER_PHONE_SPLIT_PATTERN = re.compile(r"[|/]|\s{2,}")
-
-
 def _extract_lead_records(raw_text):
     """Parses every line of OCR'd text into one lead record per line —
     handles a notebook page listing many rows ("53) Mohana - 9176912189 |
@@ -169,36 +189,30 @@ def _extract_lead_records(raw_text):
     pattern: OCR text is noisy enough (missing dashes, merged/garbled
     delimiters, misread digits) that requiring the *entire* line to match
     one exact shape silently dropped any row that deviated even slightly.
-    Finding the phone number first, then splitting whatever surrounds it,
-    survives far more of those variations — every line with a phone-shaped
-    number becomes a row; only text that has none is treated as a
-    continuation of the previous row (e.g. a wrapped clarifier like
-    "(Priya)" under a previous line) instead of being silently discarded.
-
-    Falls back to a single best-effort Name/Contact extraction across the
-    whole block when no line has a phone number at all (e.g. a business
-    card photo, not a numbered list).
-
-    Returns a list of dicts: {name, contact_number, groom_for_whom, location}.
     """
-    lines = [line.strip() for line in (raw_text or "").splitlines() if line.strip()]
 
+    lines = [line.strip() for line in (raw_text or "").splitlines() if line.strip()]
     records = []
+
     for line in lines:
-        phone_match = _PHONE_PATTERN.search(line)
+        phone_match, phone_clean = _find_phone(line)
 
         if not phone_match:
             # No phone on this line — likely a wrapped continuation of the
             # previous row (e.g. "(Priya)" under a Maha Lakshmi row) rather
             # than a new one. Fold it into whichever of that row's
-            # relation/location fields is still empty instead of dropping it.
+            # relation/location fields is still empty.
             if records:
                 extra = line.strip(" -–—|/()")
                 if extra:
-                    if not records[-1]["groom_for_whom"]:
-                        records[-1]["groom_for_whom"] = extra
-                    elif not records[-1]["location"]:
-                        records[-1]["location"] = extra
+                    last = records[-1]
+                    if not last["groom_for_whom"]:
+                        last["groom_for_whom"] = extra
+                    elif not last["location"]:
+                        last["location"] = f"{last['location']} {extra}".strip()
+                    else:
+                        # Both filled, append to groom_for_whom to keep it
+                        last["groom_for_whom"] = f"{last['groom_for_whom']} {extra}".strip()
             continue
 
         before = line[: phone_match.start()]
@@ -213,26 +227,30 @@ def _extract_lead_records(raw_text):
             for part in _AFTER_PHONE_SPLIT_PATTERN.split(after)
             if part.strip(" -–—|/\t")
         ]
+
+        # Guard: if first after_part is actually another phone (OCR split issue), ignore it
+        if after_parts and _find_phone(after_parts[0])[0] and len(re.sub(r"[^\d]", "", after_parts[0])) >= 8:
+            after_parts = after_parts[1:]
+
         relation = after_parts[0] if len(after_parts) > 0 else None
         location = after_parts[1] if len(after_parts) > 1 else None
 
-        phone = re.sub(r"[^\d+]", "", phone_match.group(0))
-        records.append({
-            "name": name,
-            "contact_number": phone or None,
-            "groom_for_whom": relation,
-            "location": location,
-        })
+        records.append(
+            {
+                "name": name,
+                "contact_number": phone_clean[:15] if phone_clean else None,
+                "groom_for_whom": relation,
+                "location": location,
+            }
+        )
 
     if records:
         return records
 
     # Fallback: single best-effort Name / Contact Number extraction from
     # the whole block of text (e.g. a business card, not a numbered list).
-    phone_match = _PHONE_PATTERN.search(raw_text or "")
-    contact_number = None
-    if phone_match:
-        contact_number = re.sub(r"[^\d+]", "", phone_match.group(0))
+    phone_match, phone_clean = _find_phone(raw_text or "")
+    contact_number = phone_clean if phone_match else None
 
     name = None
     for line in lines:
@@ -245,7 +263,7 @@ def _extract_lead_records(raw_text):
         for line in lines:
             if phone_match and phone_match.group(0) in line:
                 continue
-            if re.fullmatch(r"[\d\s+\-]+", line):
+            if re.fullmatch(r"[\d\s+\-\/\(\)]+", line):
                 continue
             name = line
             break
@@ -253,12 +271,14 @@ def _extract_lead_records(raw_text):
     if not name:
         return []
 
-    return [{
-        "name": name,
-        "contact_number": contact_number,
-        "groom_for_whom": None,
-        "location": None,
-    }]
+    return [
+        {
+            "name": name,
+            "contact_number": contact_number,
+            "groom_for_whom": None,
+            "location": None,
+        }
+    ]
 
 
 @lead_uploads_bp.route("/template", methods=["GET"])
@@ -267,8 +287,8 @@ def _extract_lead_records(raw_text):
 def download_lead_upload_template(token_response):
     """Header-only .xlsx matching EXPECTED_COLUMNS, so the uploader
     doesn't have to guess column names/order by hand."""
-    current_user = get_current_user()
 
+    current_user = get_current_user()
     if not _can_upload_leads(current_user):
         return jsonify({"message": "Admin or CRM Marketing privileges required"}), 403
 
@@ -279,7 +299,6 @@ def download_lead_upload_template(token_response):
     # One example row so the format is unambiguous — not required, the
     # uploader can delete it before adding their own rows.
     sheet.append(["Jane Doe", "9876543210", "jane@example.com", "Walk-in", "New", "Self", "Chennai"])
-
     for column_cells in sheet.columns:
         values = [str(cell.value) for cell in column_cells if cell.value is not None]
         max_length = max((len(v) for v in values), default=10)
@@ -297,7 +316,7 @@ def download_lead_upload_template(token_response):
     )
 
 
-@lead_uploads_bp.route("/", methods=["GET"])  # CHANGED: relative
+@lead_uploads_bp.route("/", methods=["GET"])
 @jwt_required()
 @with_token
 def list_lead_uploads(token_response):
@@ -305,9 +324,9 @@ def list_lead_uploads(token_response):
     query = apply_search_filters(query, request.args, ["file_name", "status"])
     if request.args.get("is_active") is not None:
         query = query.filter(
-            LeadUploadBatch.is_active
-            == (request.args.get("is_active").lower() in {"true", "1", "yes"})
+            LeadUploadBatch.is_active == (request.args.get("is_active").lower() in {"true", "1", "yes"})
         )
+
     return jsonify(
         {
             "message": "Lead upload batches fetched",
@@ -317,13 +336,14 @@ def list_lead_uploads(token_response):
     ), 200
 
 
-@lead_uploads_bp.route("/<int:batch_id>", methods=["GET"])  # CHANGED: relative
+@lead_uploads_bp.route("/<int:batch_id>", methods=["GET"])
 @jwt_required()
 @with_token
 def get_lead_upload(batch_id, token_response):
     batch, error_response = fetch_or_404(LeadUploadBatch, batch_id)
     if error_response:
         return error_response
+
     return jsonify(
         {
             "message": "Lead upload batch fetched",
@@ -342,8 +362,8 @@ def download_lead_upload_report(batch_id, token_response):
     not just the first. Admin-only: a CRM Marketing login can upload and
     preview what a photo extracted, but not download it, mirroring the
     same split as /leads/report (the main Lead Generation Report)."""
-    current_user = get_current_user()
 
+    current_user = get_current_user()
     if not is_admin(current_user):
         return jsonify({"message": "Admin privileges required"}), 403
 
@@ -351,11 +371,7 @@ def download_lead_upload_report(batch_id, token_response):
     if error_response:
         return error_response
 
-    leads = (
-        Lead.query.filter(Lead.upload_batch_id == batch_id)
-        .order_by(Lead.id.asc())
-        .all()
-    )
+    leads = Lead.query.filter(Lead.upload_batch_id == batch_id).order_by(Lead.id.asc()).all()
 
     workbook = Workbook()
     sheet = workbook.active
@@ -363,12 +379,14 @@ def download_lead_upload_report(batch_id, token_response):
     sheet.append(["Customer Name", "Mobile Number", "Groom For Whom", "Location"])
 
     for lead in leads:
-        sheet.append([
-            lead.lead_name or "-",
-            lead.contact_number or "-",
-            lead.groom_for_whom or "-",
-            lead.location or "-",
-        ])
+        sheet.append(
+            [
+                lead.lead_name or "-",
+                lead.contact_number or "-",
+                lead.groom_for_whom or "-",
+                lead.location or "-",
+            ]
+        )
 
     for column_cells in sheet.columns:
         values = [str(cell.value) for cell in column_cells if cell.value is not None]
@@ -392,7 +410,6 @@ def download_lead_upload_report(batch_id, token_response):
 @with_token
 def upload_leads(token_response):
     current_user = get_current_user()
-
     if not _can_upload_leads(current_user):
         return jsonify({"message": "Admin or CRM Marketing privileges required"}), 403
 
@@ -420,8 +437,7 @@ def upload_leads(token_response):
 
     # A non-admin (CRM Marketing) login can only ever assign leads to
     # themselves — whatever they submit is overridden, mirroring
-    # meetings.py's _attribute_registration pattern, so the UI-level
-    # restriction to "just their own name" can't be bypassed via the API.
+    # meetings.py's _attribute_registration pattern
     if not is_admin(current_user):
         assigned_to = creator_employee_id
 
@@ -498,11 +514,9 @@ def upload_leads(token_response):
 @with_token
 def upload_lead_photo(token_response):
     """OCR a single lead photo (phone-gallery picture of handwritten/typed
-    notes) into one Lead. Uses EasyOCR (see requirements.txt) — a plain
-    pip package, no OS-level binary to install, so this works the same
-    on any machine that installed requirements.txt."""
-    current_user = get_current_user()
+    notes) into Leads. Now extracts ALL rows per photo."""
 
+    current_user = get_current_user()
     if not _can_upload_leads(current_user):
         return jsonify({"message": "Admin or CRM Marketing privileges required"}), 403
 
@@ -528,20 +542,20 @@ def upload_lead_photo(token_response):
         except (TypeError, ValueError):
             return jsonify({"message": "Invalid assigned_to value"}), 400
 
-    # Same override as upload_leads: a non-admin login can only assign to
-    # themselves, regardless of what's submitted.
     if not is_admin(current_user):
         assigned_to = creator_employee_id
 
     try:
         raw_text = _run_ocr(file.read(), file.filename)
     except OcrNotConfiguredError:
-        return jsonify({
-            "message": (
-                "OCR is not configured on this server — set OCR_SPACE_API_KEY "
-                "(free key at https://ocr.space/ocrapi/freekey)."
-            )
-        }), 500
+        return jsonify(
+            {
+                "message": (
+                    "OCR is not configured on this server — set OCR_SPACE_API_KEY "
+                    "(free key at https://ocr.space/ocrapi/freekey)."
+                )
+            }
+        ), 500
     except requests.RequestException as exc:
         return jsonify({"message": f"Could not reach the OCR service: {exc}"}), 502
     except Exception as exc:
@@ -553,10 +567,12 @@ def upload_lead_photo(token_response):
     records = _extract_lead_records(raw_text)
 
     if not records:
-        return jsonify({
-            "message": "Could not identify any lead rows in the image — please add them manually",
-            "data": {"raw_text": raw_text.strip()},
-        }), 422
+        return jsonify(
+            {
+                "message": "Could not identify any lead rows in the image — please add them manually",
+                "data": {"raw_text": raw_text.strip()},
+            }
+        ), 422
 
     batch = LeadUploadBatch(
         uploaded_by=current_user.id,
@@ -567,9 +583,6 @@ def upload_lead_photo(token_response):
     db.session.add(batch)
     db.session.flush()
 
-    # The full raw OCR text is kept only on the first lead of the batch
-    # (rather than duplicated onto every row) so a human can still open it
-    # to verify/correct anything misread, without bloating every row.
     leads = []
     for index, record in enumerate(records):
         lead = _build_lead(
@@ -597,23 +610,24 @@ def upload_lead_photo(token_response):
         db.session.rollback()
         return jsonify({"message": f"Failed to save the extracted leads: {exc}"}), 500
 
-    return jsonify({
-        "message": f"{len(leads)} lead(s) extracted from photo",
-        "data": {
-            "batch": batch.to_dict(),
-            "leads": [lead.to_dict() for lead in leads],
-            "raw_text": raw_text.strip(),
-        },
-        "token_response": token_response,
-    }), 201
+    return jsonify(
+        {
+            "message": f"{len(leads)} lead(s) extracted from photo",
+            "data": {
+                "batch": batch.to_dict(),
+                "leads": [lead.to_dict() for lead in leads],
+                "raw_text": raw_text.strip(),
+            },
+            "token_response": token_response,
+        }
+    ), 201
 
 
-@lead_uploads_bp.route("/<int:batch_id>/deactivate", methods=["DELETE"])  # CHANGED: relative
+@lead_uploads_bp.route("/<int:batch_id>/deactivate", methods=["DELETE"])
 @jwt_required()
 @with_token
 def deactivate_lead_upload(batch_id, token_response):
     current_user = get_current_user()
-
     if not is_admin(current_user):
         return jsonify({"message": "Admin privileges required"}), 403
 
@@ -632,6 +646,7 @@ def deactivate_lead_upload(batch_id, token_response):
 
     batch.is_active = False
     db.session.commit()
+
     return jsonify(
         {
             "message": "Lead upload batch deactivated",
