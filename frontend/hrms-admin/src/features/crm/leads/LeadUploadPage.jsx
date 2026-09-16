@@ -903,7 +903,7 @@ export default function LeadUploadPage() {
               <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">
                 Extracted Details {lastExtraction.leads?.length ? `(${lastExtraction.leads.length})` : ""}
               </p>
-              {lastExtraction.batch?.id && lastExtraction.leads?.length > 0 && (
+              {!isEmployeeLogin && lastExtraction.batch?.id && lastExtraction.leads?.length > 0 && (
                 <button
                   type="button"
                   onClick={() => handleDownloadBatchReport(lastExtraction.batch.id)}
@@ -1338,7 +1338,7 @@ export default function LeadUploadPage() {
             </p>
           )}
 
-          {previewLeads?.length > 0 && (
+          {!isEmployeeLogin && previewLeads?.length > 0 && (
             <div className="mt-3 flex justify-end">
               <button
                 type="button"

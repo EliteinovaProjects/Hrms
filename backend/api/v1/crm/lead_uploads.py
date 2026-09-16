@@ -147,30 +147,37 @@ def _build_lead(
     )
 
 
-# One notebook-row line, e.g. "53) Mohana - 9176912189 | cousin | Cuddalore"
-# or "56 Poornima – 9962845282 / mom / Chennai" — permissive on the leading
-# index, the name/number separator, and the field separator (OCR output is
-# noisy), but requires a name and a phone-shaped number to count as a row.
-_LEAD_ROW_PATTERN = re.compile(
-    r"""^\s*
-    (?:\(?\d{1,4}\)?[.\):\-]?\s*)?          # optional leading index: "53)", "53.", "(53)"
-    (?P<name>[^\-–—|/0-9][^\-–—|]*?)         # name — doesn't start with a digit/dash
-    \s*[\-–—]\s*
-    (?P<phone>\+?\d[\d\s]{6,}\d)             # phone number
-    \s*(?:[|/]\s*(?P<relation>[^|/]+?))?     # optional "| relation"
-    \s*(?:[|/]\s*(?P<location>[^|/]+?))?     # optional "| location"
-    \s*$""",
-    re.VERBOSE,
-)
+# Leading row index, e.g. "53)", "53.", "(53)" — stripped off the front of
+# a line before the name is taken, rather than baked into one all-or-nothing
+# line pattern (a single missed group there used to drop the whole row).
+_LEADING_INDEX_PATTERN = re.compile(r"^\s*\(?\d{1,4}\)?[.\):\-]?\s*")
+
+# Splits the text after the phone number into up to two fields (relation,
+# location) — OCR output is inconsistent about which delimiter survives
+# ("|", "/", or just a run of 2+ spaces where a pipe was), so any of them
+# is accepted.
+_AFTER_PHONE_SPLIT_PATTERN = re.compile(r"[|/]|\s{2,}")
 
 
 def _extract_lead_records(raw_text):
     """Parses every line of OCR'd text into one lead record per line —
     handles a notebook page listing many rows ("53) Mohana - 9176912189 |
     cousin | Cuddalore"), one Lead per row, instead of a single lead per
-    photo. Falls back to a single best-effort Name/Contact extraction (the
-    old behaviour) when nothing matches the row pattern, e.g. a photo of
-    just one business card.
+    photo.
+
+    Anchored on the phone number rather than a single rigid whole-line
+    pattern: OCR text is noisy enough (missing dashes, merged/garbled
+    delimiters, misread digits) that requiring the *entire* line to match
+    one exact shape silently dropped any row that deviated even slightly.
+    Finding the phone number first, then splitting whatever surrounds it,
+    survives far more of those variations — every line with a phone-shaped
+    number becomes a row; only text that has none is treated as a
+    continuation of the previous row (e.g. a wrapped clarifier like
+    "(Priya)" under a previous line) instead of being silently discarded.
+
+    Falls back to a single best-effort Name/Contact extraction across the
+    whole block when no line has a phone number at all (e.g. a business
+    card photo, not a numbered list).
 
     Returns a list of dicts: {name, contact_number, groom_for_whom, location}.
     """
@@ -178,18 +185,38 @@ def _extract_lead_records(raw_text):
 
     records = []
     for line in lines:
-        # A continuation line (e.g. wrapped relation text on its own line,
-        # like "(Priya)" under row 61 in a handwritten list) has no phone
-        # number of its own — skip it rather than mis-parsing it as a row.
-        match = _LEAD_ROW_PATTERN.match(line)
-        if not match:
+        phone_match = _PHONE_PATTERN.search(line)
+
+        if not phone_match:
+            # No phone on this line — likely a wrapped continuation of the
+            # previous row (e.g. "(Priya)" under a Maha Lakshmi row) rather
+            # than a new one. Fold it into whichever of that row's
+            # relation/location fields is still empty instead of dropping it.
+            if records:
+                extra = line.strip(" -–—|/()")
+                if extra:
+                    if not records[-1]["groom_for_whom"]:
+                        records[-1]["groom_for_whom"] = extra
+                    elif not records[-1]["location"]:
+                        records[-1]["location"] = extra
             continue
-        name = (match.group("name") or "").strip(" -–—|/")
+
+        before = line[: phone_match.start()]
+        after = line[phone_match.end() :]
+
+        name = _LEADING_INDEX_PATTERN.sub("", before).strip(" -–—|/\t")
         if not name:
             continue
-        phone = re.sub(r"[^\d+]", "", match.group("phone") or "")
-        relation = (match.group("relation") or "").strip() or None
-        location = (match.group("location") or "").strip() or None
+
+        after_parts = [
+            part.strip(" -–—|/\t")
+            for part in _AFTER_PHONE_SPLIT_PATTERN.split(after)
+            if part.strip(" -–—|/\t")
+        ]
+        relation = after_parts[0] if len(after_parts) > 0 else None
+        location = after_parts[1] if len(after_parts) > 1 else None
+
+        phone = re.sub(r"[^\d+]", "", phone_match.group(0))
         records.append({
             "name": name,
             "contact_number": phone or None,
@@ -312,17 +339,17 @@ def get_lead_upload(batch_id, token_response):
 def download_lead_upload_report(batch_id, token_response):
     """Excel export of every lead a batch produced — Customer Name, Mobile
     Number, Groom For Whom, Location — covering every row in the batch,
-    not just the first. Available to admin, or the CRM Marketing employee
-    who uploaded that batch themselves, so they can verify what a photo
-    upload actually extracted."""
+    not just the first. Admin-only: a CRM Marketing login can upload and
+    preview what a photo extracted, but not download it, mirroring the
+    same split as /leads/report (the main Lead Generation Report)."""
     current_user = get_current_user()
+
+    if not is_admin(current_user):
+        return jsonify({"message": "Admin privileges required"}), 403
 
     batch, error_response = fetch_or_404(LeadUploadBatch, batch_id)
     if error_response:
         return error_response
-
-    if not is_admin(current_user) and batch.uploaded_by != current_user.id:
-        return jsonify({"message": "You can only download your own uploads"}), 403
 
     leads = (
         Lead.query.filter(Lead.upload_batch_id == batch_id)
