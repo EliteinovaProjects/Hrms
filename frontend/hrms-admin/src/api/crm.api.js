@@ -40,6 +40,8 @@ export const crmApi = {
       });
     },
     template: () => axiosClient.get(C.LEAD_UPLOADS_TEMPLATE, { responseType: "blob" }),
+    report: (batchId) =>
+      axiosClient.get(C.LEAD_UPLOADS_REPORT(batchId), { responseType: "blob" }),
   },
 
   leadWeeklySnapshots: {

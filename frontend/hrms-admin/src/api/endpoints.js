@@ -325,6 +325,9 @@ export const API = {
     LEAD_UPLOADS_TEMPLATE:
       "/lead-uploads/template",
 
+    LEAD_UPLOADS_REPORT: (batchId) =>
+      `/lead-uploads/${batchId}/report`,
+
     LEADS_REPORT:
       "/leads/report",
 

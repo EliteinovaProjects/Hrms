@@ -50,7 +50,7 @@ lead_uploads_bp = Blueprint("lead_uploads_bp", __name__)
 
 ALLOWED_EXTENSIONS = {"xlsx"}
 ALLOWED_IMAGE_EXTENSIONS = {"png", "jpg", "jpeg"}
-EXPECTED_COLUMNS = ["lead_name", "contact_number", "email", "source", "status"]
+EXPECTED_COLUMNS = ["lead_name", "contact_number", "email", "source", "status", "groom_for_whom", "location"]
 
 # International-ish phone pattern: an optional "+", then 8-15 digits with
 # optional spaces/dashes in between — permissive on purpose since OCR text
@@ -126,6 +126,8 @@ def _build_lead(
     created_by=None,
     upload_batch_id=None,
     notes=None,
+    groom_for_whom=None,
+    location=None,
 ):
     """Single place that shapes a Lead row from raw field values, shared by
     the .xlsx row loop and the photo/OCR path so both stay in sync."""
@@ -139,29 +141,73 @@ def _build_lead(
         created_by=created_by,
         upload_batch_id=upload_batch_id,
         notes=(str(notes).strip() if notes else None),
+        groom_for_whom=(str(groom_for_whom).strip()[:150] if groom_for_whom else None),
+        location=(str(location).strip()[:150] if location else None),
         is_active=True,
     )
 
 
-def _extract_lead_fields(raw_text):
-    """Best-effort Name / Contact Number extraction from noisy OCR text.
+# One notebook-row line, e.g. "53) Mohana - 9176912189 | cousin | Cuddalore"
+# or "56 Poornima – 9962845282 / mom / Chennai" — permissive on the leading
+# index, the name/number separator, and the field separator (OCR output is
+# noisy), but requires a name and a phone-shaped number to count as a row.
+_LEAD_ROW_PATTERN = re.compile(
+    r"""^\s*
+    (?:\(?\d{1,4}\)?[.\):\-]?\s*)?          # optional leading index: "53)", "53.", "(53)"
+    (?P<name>[^\-–—|/0-9][^\-–—|]*?)         # name — doesn't start with a digit/dash
+    \s*[\-–—]\s*
+    (?P<phone>\+?\d[\d\s]{6,}\d)             # phone number
+    \s*(?:[|/]\s*(?P<relation>[^|/]+?))?     # optional "| relation"
+    \s*(?:[|/]\s*(?P<location>[^|/]+?))?     # optional "| location"
+    \s*$""",
+    re.VERBOSE,
+)
 
-    Contact number: the first phone-shaped run of digits anywhere in the
-    text, normalized to digits (and a leading "+") only.
 
-    Name: an explicit "Name:" / "Name -" prefixed line if present, else
-    the first non-empty line that isn't itself the matched phone number —
-    handwritten notes are usually "Name" on one line and the number on
-    another.
+def _extract_lead_records(raw_text):
+    """Parses every line of OCR'd text into one lead record per line —
+    handles a notebook page listing many rows ("53) Mohana - 9176912189 |
+    cousin | Cuddalore"), one Lead per row, instead of a single lead per
+    photo. Falls back to a single best-effort Name/Contact extraction (the
+    old behaviour) when nothing matches the row pattern, e.g. a photo of
+    just one business card.
+
+    Returns a list of dicts: {name, contact_number, groom_for_whom, location}.
     """
+    lines = [line.strip() for line in (raw_text or "").splitlines() if line.strip()]
+
+    records = []
+    for line in lines:
+        # A continuation line (e.g. wrapped relation text on its own line,
+        # like "(Priya)" under row 61 in a handwritten list) has no phone
+        # number of its own — skip it rather than mis-parsing it as a row.
+        match = _LEAD_ROW_PATTERN.match(line)
+        if not match:
+            continue
+        name = (match.group("name") or "").strip(" -–—|/")
+        if not name:
+            continue
+        phone = re.sub(r"[^\d+]", "", match.group("phone") or "")
+        relation = (match.group("relation") or "").strip() or None
+        location = (match.group("location") or "").strip() or None
+        records.append({
+            "name": name,
+            "contact_number": phone or None,
+            "groom_for_whom": relation,
+            "location": location,
+        })
+
+    if records:
+        return records
+
+    # Fallback: single best-effort Name / Contact Number extraction from
+    # the whole block of text (e.g. a business card, not a numbered list).
     phone_match = _PHONE_PATTERN.search(raw_text or "")
     contact_number = None
     if phone_match:
         contact_number = re.sub(r"[^\d+]", "", phone_match.group(0))
 
     name = None
-    lines = [line.strip() for line in (raw_text or "").splitlines() if line.strip()]
-
     for line in lines:
         prefixed = re.match(r"(?i)^name\s*[:\-]\s*(.+)$", line)
         if prefixed:
@@ -177,7 +223,15 @@ def _extract_lead_fields(raw_text):
             name = line
             break
 
-    return name, contact_number
+    if not name:
+        return []
+
+    return [{
+        "name": name,
+        "contact_number": contact_number,
+        "groom_for_whom": None,
+        "location": None,
+    }]
 
 
 @lead_uploads_bp.route("/template", methods=["GET"])
@@ -197,7 +251,7 @@ def download_lead_upload_template(token_response):
     sheet.append(EXPECTED_COLUMNS)
     # One example row so the format is unambiguous — not required, the
     # uploader can delete it before adding their own rows.
-    sheet.append(["Jane Doe", "9876543210", "jane@example.com", "Walk-in", "New"])
+    sheet.append(["Jane Doe", "9876543210", "jane@example.com", "Walk-in", "New", "Self", "Chennai"])
 
     for column_cells in sheet.columns:
         values = [str(cell.value) for cell in column_cells if cell.value is not None]
@@ -250,6 +304,60 @@ def get_lead_upload(batch_id, token_response):
             "token_response": token_response,
         }
     ), 200
+
+
+@lead_uploads_bp.route("/<int:batch_id>/report", methods=["GET"])
+@jwt_required()
+@with_token
+def download_lead_upload_report(batch_id, token_response):
+    """Excel export of every lead a batch produced — Customer Name, Mobile
+    Number, Groom For Whom, Location — covering every row in the batch,
+    not just the first. Available to admin, or the CRM Marketing employee
+    who uploaded that batch themselves, so they can verify what a photo
+    upload actually extracted."""
+    current_user = get_current_user()
+
+    batch, error_response = fetch_or_404(LeadUploadBatch, batch_id)
+    if error_response:
+        return error_response
+
+    if not is_admin(current_user) and batch.uploaded_by != current_user.id:
+        return jsonify({"message": "You can only download your own uploads"}), 403
+
+    leads = (
+        Lead.query.filter(Lead.upload_batch_id == batch_id)
+        .order_by(Lead.id.asc())
+        .all()
+    )
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Leads"
+    sheet.append(["Customer Name", "Mobile Number", "Groom For Whom", "Location"])
+
+    for lead in leads:
+        sheet.append([
+            lead.lead_name or "-",
+            lead.contact_number or "-",
+            lead.groom_for_whom or "-",
+            lead.location or "-",
+        ])
+
+    for column_cells in sheet.columns:
+        values = [str(cell.value) for cell in column_cells if cell.value is not None]
+        max_length = max((len(v) for v in values), default=10)
+        sheet.column_dimensions[column_cells[0].column_letter].width = max(16, max_length + 2)
+
+    buffer = io.BytesIO()
+    workbook.save(buffer)
+    buffer.seek(0)
+
+    return send_file(
+        buffer,
+        as_attachment=True,
+        download_name=f"lead_upload_{batch_id}.xlsx",
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
 
 @lead_uploads_bp.route("/", methods=["POST"])
@@ -329,6 +437,8 @@ def upload_leads(token_response):
                 assigned_to=assigned_to,
                 created_by=creator_employee_id,
                 upload_batch_id=batch.id,
+                groom_for_whom=(row[5] if len(row) > 5 else None),
+                location=(row[6] if len(row) > 6 else None),
             )
             db.session.add(lead)
             success_count += 1
@@ -413,36 +523,44 @@ def upload_lead_photo(token_response):
     if not raw_text or not raw_text.strip():
         return jsonify({"message": "No readable text was found in the image"}), 400
 
-    name, contact_number = _extract_lead_fields(raw_text)
+    records = _extract_lead_records(raw_text)
 
-    if not name:
+    if not records:
         return jsonify({
-            "message": "Could not identify a lead name in the image — please add it manually",
+            "message": "Could not identify any lead rows in the image — please add them manually",
             "data": {"raw_text": raw_text.strip()},
         }), 422
 
     batch = LeadUploadBatch(
         uploaded_by=current_user.id,
         file_name=file.filename,
-        total_rows=1,
+        total_rows=len(records),
         status="Processing",
     )
     db.session.add(batch)
     db.session.flush()
 
-    lead = _build_lead(
-        lead_name=name,
-        contact_number=contact_number,
-        source="Photo Upload",
-        status="New",
-        assigned_to=assigned_to,
-        created_by=creator_employee_id,
-        upload_batch_id=batch.id,
-        notes=raw_text,
-    )
-    db.session.add(lead)
+    # The full raw OCR text is kept only on the first lead of the batch
+    # (rather than duplicated onto every row) so a human can still open it
+    # to verify/correct anything misread, without bloating every row.
+    leads = []
+    for index, record in enumerate(records):
+        lead = _build_lead(
+            lead_name=record["name"],
+            contact_number=record.get("contact_number"),
+            source="Photo Upload",
+            status="New",
+            assigned_to=assigned_to,
+            created_by=creator_employee_id,
+            upload_batch_id=batch.id,
+            groom_for_whom=record.get("groom_for_whom"),
+            location=record.get("location"),
+            notes=raw_text if index == 0 else None,
+        )
+        db.session.add(lead)
+        leads.append(lead)
 
-    batch.success_count = 1
+    batch.success_count = len(leads)
     batch.failed_count = 0
     batch.status = "Completed"
 
@@ -450,13 +568,13 @@ def upload_lead_photo(token_response):
         db.session.commit()
     except Exception as exc:
         db.session.rollback()
-        return jsonify({"message": f"Failed to save the extracted lead: {exc}"}), 500
+        return jsonify({"message": f"Failed to save the extracted leads: {exc}"}), 500
 
     return jsonify({
-        "message": "Lead extracted from photo",
+        "message": f"{len(leads)} lead(s) extracted from photo",
         "data": {
             "batch": batch.to_dict(),
-            "lead": lead.to_dict(),
+            "leads": [lead.to_dict() for lead in leads],
             "raw_text": raw_text.strip(),
         },
         "token_response": token_response,

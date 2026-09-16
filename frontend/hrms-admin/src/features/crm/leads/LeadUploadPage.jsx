@@ -176,6 +176,13 @@ const CloseIcon = () => (
   </svg>
 );
 
+const EyeIcon = () => (
+  <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+    <path strokeLinecap="round" strokeLinejoin="round" d="M2.5 12s3.5-7 9.5-7 9.5 7 9.5 7-3.5 7-9.5 7-9.5-7-9.5-7z" />
+    <circle cx="12" cy="12" r="3" />
+  </svg>
+);
+
 const CalendarIcon = () => (
   <svg xmlns="http://www.w3.org/2000/svg" className="h-3.5 w-3.5 shrink-0 text-slate-400" fill="none" viewBox="0 0 20 20" stroke="currentColor" strokeWidth="1.4">
     <rect x="3" y="4" width="14" height="13" rx="1.5" />
@@ -363,6 +370,35 @@ export default function LeadUploadPage() {
   const [viewMode, setViewMode] = useState("table");
   const [page, setPage] = useState(1);
 
+  // Batch "preview" — shows what a batch actually produced (its extracted
+  // leads), opened via the eye icon next to each upload row.
+  const [previewBatch, setPreviewBatch] = useState(null);
+  const [previewLeads, setPreviewLeads] = useState(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
+
+  const openBatchPreview = async (batch) => {
+    setPreviewBatch(batch);
+    setPreviewLeads(null);
+    setPreviewLoading(true);
+    try {
+      const res = await crmApi.leads.list({ upload_batch_id: batch.id, per_page: 500 });
+      setPreviewLeads(res?.data?.data?.items || []);
+    } catch (error) {
+      showToast(
+        error?.response?.data?.message || error?.message || "Failed to load leads for this upload",
+        "error"
+      );
+      setPreviewLeads([]);
+    } finally {
+      setPreviewLoading(false);
+    }
+  };
+
+  const closeBatchPreview = () => {
+    setPreviewBatch(null);
+    setPreviewLeads(null);
+  };
+
   const {
     data: allData,
     isLoading,
@@ -533,6 +569,8 @@ export default function LeadUploadPage() {
     }
   };
 
+  const [downloadingReport, setDownloadingReport] = useState(false);
+
   const handlePhotoUpload = async () => {
     if (!selectedPhoto) {
       showToast("Please choose a lead photo to upload", "error");
@@ -548,10 +586,13 @@ export default function LeadUploadPage() {
       const extracted = result?.data?.data;
       setLastExtraction(extracted || null);
 
+      const leads = extracted?.leads || [];
       showToast(
-        `Lead extracted: ${extracted?.lead?.lead_name || "unnamed"}${
-          extracted?.lead?.contact_number ? ` · ${extracted.lead.contact_number}` : ""
-        }`,
+        leads.length > 1
+          ? `${leads.length} leads extracted from the photo`
+          : `Lead extracted: ${leads[0]?.lead_name || "unnamed"}${
+              leads[0]?.contact_number ? ` · ${leads[0].contact_number}` : ""
+            }`,
         "success"
       );
 
@@ -566,6 +607,21 @@ export default function LeadUploadPage() {
         error?.response?.data?.message || error?.message || "Photo upload failed",
         "error"
       );
+    }
+  };
+
+  const handleDownloadBatchReport = async (batchId) => {
+    setDownloadingReport(true);
+    try {
+      const res = await crmApi.leadUploads.report(batchId);
+      downloadBlob(res, `lead_upload_${batchId}.xlsx`);
+    } catch (error) {
+      showToast(
+        error?.response?.data?.message || error?.message || "Failed to download the report",
+        "error"
+      );
+    } finally {
+      setDownloadingReport(false);
     }
   };
 
@@ -731,9 +787,10 @@ export default function LeadUploadPage() {
             Lead Photo (auto-extract)
           </h2>
           <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
-            Upload a photo of handwritten/typed lead notes from your gallery — the name and
-            contact number are extracted automatically. Supported formats: PNG, JPG, JPEG.
-            Large photos are compressed automatically before upload.
+            Upload a photo of handwritten/typed lead notes from your gallery — every row (name,
+            mobile number, and optionally who it's for and their location) is extracted
+            automatically into its own lead. Supported formats: PNG, JPG, JPEG. Large photos are
+            compressed automatically before upload.
           </p>
         </div>
 
@@ -842,28 +899,60 @@ export default function LeadUploadPage() {
 
         {lastExtraction && (
           <div className="mt-4 rounded-lg border border-slate-200 bg-white p-3 dark:border-white/10 dark:bg-white/[0.04]">
-            <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">
-              Extracted Details
-            </p>
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">
+                Extracted Details {lastExtraction.leads?.length ? `(${lastExtraction.leads.length})` : ""}
+              </p>
+              {lastExtraction.batch?.id && lastExtraction.leads?.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => handleDownloadBatchReport(lastExtraction.batch.id)}
+                  disabled={downloadingReport}
+                  className="text-[11px] font-semibold text-primary-600 hover:underline disabled:opacity-50 dark:text-primary-400"
+                >
+                  {downloadingReport ? "Downloading..." : "Download Excel"}
+                </button>
+              )}
+            </div>
 
-            {lastExtraction.lead ? (
-              <div className="mt-1.5 flex flex-wrap items-center gap-2 text-xs">
-                <Badge className="bg-emerald-50 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-300">
-                  {lastExtraction.lead.lead_name}
-                </Badge>
-                {lastExtraction.lead.contact_number && (
-                  <Badge className="bg-slate-100 text-slate-700 dark:bg-white/10 dark:text-slate-300">
-                    {lastExtraction.lead.contact_number}
-                  </Badge>
-                )}
-                <span className="text-slate-400">
-                  — saved as a Lead. Edit it from the Leads screen if anything was misread.
-                </span>
+            {lastExtraction.leads?.length > 0 ? (
+              <div className="mt-2 overflow-x-auto rounded-md border border-slate-100 dark:border-white/10">
+                <table className="w-full min-w-[560px] text-left text-xs">
+                  <thead className="bg-slate-50 text-[10px] uppercase tracking-wide text-slate-400 dark:bg-white/[0.06]">
+                    <tr>
+                      <th className="px-3 py-2 font-semibold">Customer Name</th>
+                      <th className="px-3 py-2 font-semibold">Mobile Number</th>
+                      <th className="px-3 py-2 font-semibold">Groom For Whom</th>
+                      <th className="px-3 py-2 font-semibold">Location</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100 dark:divide-white/10">
+                    {lastExtraction.leads.map((lead) => (
+                      <tr key={lead.id}>
+                        <td className="px-3 py-1.5 font-medium text-slate-800 dark:text-slate-100">
+                          {lead.lead_name}
+                        </td>
+                        <td className="px-3 py-1.5 text-slate-600 dark:text-slate-300">
+                          {lead.contact_number || "—"}
+                        </td>
+                        <td className="px-3 py-1.5 text-slate-600 dark:text-slate-300">
+                          {lead.groom_for_whom || "—"}
+                        </td>
+                        <td className="px-3 py-1.5 text-slate-600 dark:text-slate-300">
+                          {lead.location || "—"}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                <p className="border-t border-slate-100 bg-slate-50 px-3 py-1.5 text-[11px] text-slate-400 dark:border-white/10 dark:bg-white/[0.03]">
+                  Saved as Leads. Edit any row from the Leads screen if something was misread.
+                </p>
               </div>
             ) : (
               <p className="mt-1 text-xs text-red-500 dark:text-red-400">
-                Couldn't confidently extract a name — nothing was saved. Raw text read from the
-                image is shown below; add the lead manually if needed.
+                Couldn't confidently extract any leads — nothing was saved. Raw text read from the
+                image is shown below; add the lead(s) manually if needed.
               </p>
             )}
 
@@ -1038,15 +1127,25 @@ export default function LeadUploadPage() {
                     {formatDateTime(batch.created_at)}
                   </td>
                   <td className="px-4 py-3 text-right">
-                    {batch.is_active !== false && (
+                    <div className="flex items-center justify-end gap-1.5">
                       <button
                         type="button"
-                        onClick={() => setDeleteTarget(batch)}
-                        className="rounded-lg border border-red-200 px-2.5 py-1.5 text-xs font-medium text-red-600 transition hover:bg-red-50 dark:border-red-900/50 dark:text-red-400 dark:hover:bg-red-500/10"
+                        title="Preview extracted leads"
+                        onClick={() => openBatchPreview(batch)}
+                        className="flex h-8 w-8 items-center justify-center rounded-full text-slate-500 transition-colors hover:bg-slate-100 dark:text-slate-400 dark:hover:bg-slate-700"
                       >
-                        Remove
+                        <EyeIcon />
                       </button>
-                    )}
+                      {batch.is_active !== false && (
+                        <button
+                          type="button"
+                          onClick={() => setDeleteTarget(batch)}
+                          className="rounded-lg border border-red-200 px-2.5 py-1.5 text-xs font-medium text-red-600 transition hover:bg-red-50 dark:border-red-900/50 dark:text-red-400 dark:hover:bg-red-500/10"
+                        >
+                          Remove
+                        </button>
+                      )}
+                    </div>
                   </td>
                 </tr>
               ))}
@@ -1104,19 +1203,29 @@ export default function LeadUploadPage() {
                   {formatDateTime(batch.created_at)}
                 </div>
 
-                {batch.is_active !== false ? (
+                <div className="flex items-center gap-1">
                   <button
                     type="button"
-                    onClick={() => setDeleteTarget(batch)}
-                    className="rounded-lg border border-red-200 px-2 py-1 text-[11px] font-medium text-red-600 transition hover:bg-red-50 dark:border-red-900/50 dark:text-red-400 dark:hover:bg-red-500/10"
+                    title="Preview extracted leads"
+                    onClick={() => openBatchPreview(batch)}
+                    className="flex h-7 w-7 items-center justify-center rounded-full text-slate-500 transition-colors hover:bg-slate-100 dark:text-slate-400 dark:hover:bg-slate-700"
                   >
-                    Remove
+                    <EyeIcon />
                   </button>
-                ) : (
-                  <Badge className="bg-slate-100 text-slate-500 dark:bg-white/10 dark:text-slate-400">
-                    Removed
-                  </Badge>
-                )}
+                  {batch.is_active !== false ? (
+                    <button
+                      type="button"
+                      onClick={() => setDeleteTarget(batch)}
+                      className="rounded-lg border border-red-200 px-2 py-1 text-[11px] font-medium text-red-600 transition hover:bg-red-50 dark:border-red-900/50 dark:text-red-400 dark:hover:bg-red-500/10"
+                    >
+                      Remove
+                    </button>
+                  ) : (
+                    <Badge className="bg-slate-100 text-slate-500 dark:bg-white/10 dark:text-slate-400">
+                      Removed
+                    </Badge>
+                  )}
+                </div>
               </div>
             </div>
           ))}
@@ -1174,6 +1283,73 @@ export default function LeadUploadPage() {
             alt="Lead photo preview"
             className="max-h-[70vh] w-full rounded-lg object-contain"
           />
+        </Modal>
+      )}
+
+      {previewBatch && (
+        <Modal
+          open={!!previewBatch}
+          onClose={closeBatchPreview}
+          title={`Preview — ${previewBatch.file_name}`}
+          size="lg"
+        >
+          {previewLoading ? (
+            <div className="py-8 text-center text-sm text-slate-400">Loading leads...</div>
+          ) : previewLeads?.length ? (
+            <div className="max-h-[60vh] overflow-y-auto overflow-x-auto rounded-lg border border-slate-100 dark:border-white/10">
+              <table className="w-full min-w-[520px] text-left text-xs">
+                <thead className="sticky top-0 bg-slate-50 text-[10px] uppercase tracking-wide text-slate-400 dark:bg-slate-800">
+                  <tr>
+                    <th className="px-3 py-2 font-semibold">Customer Name</th>
+                    <th className="px-3 py-2 font-semibold">Mobile Number</th>
+                    <th className="px-3 py-2 font-semibold">Groom For Whom</th>
+                    <th className="px-3 py-2 font-semibold">Location</th>
+                    <th className="px-3 py-2 font-semibold">Status</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100 dark:divide-white/10">
+                  {previewLeads.map((lead) => (
+                    <tr key={lead.id}>
+                      <td className="px-3 py-1.5 font-medium text-slate-800 dark:text-slate-100">
+                        {lead.lead_name}
+                      </td>
+                      <td className="px-3 py-1.5 text-slate-600 dark:text-slate-300">
+                        {lead.contact_number || "—"}
+                      </td>
+                      <td className="px-3 py-1.5 text-slate-600 dark:text-slate-300">
+                        {lead.groom_for_whom || "—"}
+                      </td>
+                      <td className="px-3 py-1.5 text-slate-600 dark:text-slate-300">
+                        {lead.location || "—"}
+                      </td>
+                      <td className="px-3 py-1.5">
+                        <Badge className="bg-slate-100 text-slate-600 dark:bg-white/10 dark:text-slate-300">
+                          {lead.status}
+                        </Badge>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <p className="py-6 text-center text-sm text-slate-400">
+              No leads found for this upload.
+            </p>
+          )}
+
+          {previewLeads?.length > 0 && (
+            <div className="mt-3 flex justify-end">
+              <button
+                type="button"
+                onClick={() => handleDownloadBatchReport(previewBatch.id)}
+                disabled={downloadingReport}
+                className="text-xs font-semibold text-primary-600 hover:underline disabled:opacity-50 dark:text-primary-400"
+              >
+                {downloadingReport ? "Downloading..." : "Download Excel"}
+              </button>
+            </div>
+          )}
         </Modal>
       )}
     </div>

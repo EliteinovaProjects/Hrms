@@ -2295,6 +2295,11 @@ class Lead(TimestampMixin, db.Model):
     email = db.Column(db.String(150))
     source = db.Column(db.String(50))
     status = db.Column(db.String(20), default="New")
+    # Matrimony-style lead detail fields — who the lead is for ("Groom For
+    # Whom": self/son/relative name) and their location, both populated
+    # either from a manual/Excel entry or parsed off a lead photo's OCR text.
+    groom_for_whom = db.Column(db.String(150), nullable=True)
+    location = db.Column(db.String(150), nullable=True)
     # Free-text notes — for a photo/OCR-created lead this holds the raw
     # extracted text so a human can verify/correct anything the OCR
     # engine misread.

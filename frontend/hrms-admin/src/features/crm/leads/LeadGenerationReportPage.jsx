@@ -93,6 +93,22 @@ function LeadDetailsModal({ lead, onClose }) {
           </div>
           <div className="rounded-xl border border-slate-200 bg-white p-3 dark:border-white/10 dark:bg-white/[0.04]">
             <p className="text-[9px] font-semibold uppercase tracking-wider text-slate-400">
+              Groom For Whom
+            </p>
+            <p className="mt-1 text-sm font-semibold text-slate-800 dark:text-slate-200">
+              {lead.groom_for_whom || "-"}
+            </p>
+          </div>
+          <div className="rounded-xl border border-slate-200 bg-white p-3 dark:border-white/10 dark:bg-white/[0.04]">
+            <p className="text-[9px] font-semibold uppercase tracking-wider text-slate-400">
+              Location
+            </p>
+            <p className="mt-1 text-sm font-semibold text-slate-800 dark:text-slate-200">
+              {lead.location || "-"}
+            </p>
+          </div>
+          <div className="rounded-xl border border-slate-200 bg-white p-3 dark:border-white/10 dark:bg-white/[0.04]">
+            <p className="text-[9px] font-semibold uppercase tracking-wider text-slate-400">
               Assigned To
             </p>
             <p className="mt-1 text-sm font-semibold text-slate-800 dark:text-slate-200">
@@ -251,6 +267,20 @@ export default function LeadGenerationReportPage() {
       label: "Source",
       render: (row) => (
         <span className="text-slate-600 dark:text-slate-300">{row.source || "-"}</span>
+      ),
+    },
+    {
+      key: "groom_for_whom",
+      label: "Groom For Whom",
+      render: (row) => (
+        <span className="text-slate-600 dark:text-slate-300">{row.groom_for_whom || "-"}</span>
+      ),
+    },
+    {
+      key: "location",
+      label: "Location",
+      render: (row) => (
+        <span className="text-slate-600 dark:text-slate-300">{row.location || "-"}</span>
       ),
     },
     {
