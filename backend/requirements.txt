@@ -9,7 +9,6 @@ marshmallow
 bcrypt
 flask_jwt_extended
 openpyxl
-cloudinary
 reportlab
 requests
 razorpay

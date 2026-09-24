@@ -15,7 +15,12 @@ class Config:
     MAX_CONTENT_LENGTH = 5 * 1024 * 1024
     ALLOWED_IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "gif"}
     ALLOWED_DOCUMENT_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "pdf"}
-    CLOUDINARY_URL = os.getenv("CLOUDINARY_URL")
+    # Uploaded files (profile pictures, documents, receipts, screenshots)
+    # are stored on local disk here and served via /uploads/<path>.
+    UPLOAD_FOLDER = os.getenv("UPLOAD_FOLDER", os.path.join(BASE_DIR, "uploads"))
+    # Base URL used when building file links, e.g. http://localhost:5000.
+    # Leave unset to use the host of the incoming request.
+    PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL")
     CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
 
     SMTP_HOST = os.getenv("SMTP_HOST")

@@ -1,13 +1,11 @@
 import os
 from datetime import date, datetime
-from urllib.parse import urlparse
 
-from flask import Flask, request
+from flask import Flask, request, send_from_directory
 
 if os.name == "nt":
     os.add_dll_directory(r"C:\Program Files\PostgreSQL\18\bin")
 
-import cloudinary
 from flask_cors import CORS
 
 from config import Config
@@ -20,15 +18,7 @@ print(app)
 
 app.config.from_object(Config)
 
-# cloudinary.config(cloudinary_url=...) only stores the raw string on this SDK
-# version — cloud_name/api_key/api_secret are otherwise left as None. Parse it
-# ourselves so uploads (profile pictures, employee documents) actually work.
-_cloudinary_url = urlparse(app.config["CLOUDINARY_URL"] or "")
-cloudinary.config(
-    cloud_name=_cloudinary_url.hostname,
-    api_key=_cloudinary_url.username,
-    api_secret=_cloudinary_url.password,
-)
+os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
 
 # Default dev origins, plus anything set via CORS_ORIGINS (comma-separated) in production
 DEFAULT_ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173", "https://hrms-frontend-rosy-nine.vercel.app"]
@@ -152,6 +142,13 @@ def _maybe_run_auto_lead_assignment():
             db.session.commit()
     except Exception:
         db.session.rollback()
+
+
+@app.route("/uploads/<path:filename>")
+def uploaded_file(filename):
+    # Serves files saved by utils.handle_upload. send_from_directory
+    # rejects paths that escape UPLOAD_FOLDER (e.g. "../").
+    return send_from_directory(app.config["UPLOAD_FOLDER"], filename)
 
 
 @app.route("/")
